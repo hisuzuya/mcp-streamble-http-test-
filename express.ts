@@ -2,15 +2,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import express from "express";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { InMemoryEventStore } from "@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js";
+import { randomUUID } from "node:crypto";
 
 const app = express();
 app.use(express.json());
 
-const transport: StreamableHTTPServerTransport =
-  new StreamableHTTPServerTransport({
-    // ステートレスなサーバーの場合、undefined を指定する
-    sessionIdGenerator: undefined,
-  });
+const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
 const mcpServer = new McpServer({ name: "my-server", version: "0.0.1" });
 
@@ -39,8 +38,54 @@ mcpServer.tool(
 
 // POST リクエストで受け付ける
 app.post("/mcp", async (req, res) => {
-  console.log("Received MCP request:", req.body);
   try {
+    // セッション ID がヘッダーに存在するか確認
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    let transport: StreamableHTTPServerTransport;
+
+    // セッション ID が存在する場合はその transport を再利用
+    if (sessionId && transports[sessionId]) {
+      transport = transports[sessionId];
+    } else if (
+      // セッション ID が存在しないかつ、初期化リクエストの場合は新しい transport を作成
+      isInitializeRequest(req.body) &&
+      !sessionId
+    ) {
+      const eventStore = new InMemoryEventStore();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        eventStore,
+        onsessioninitialized: (sessionId) => {
+          console.log(`Session initialized with ID: ${sessionId}`);
+          transports[sessionId] = transport;
+        },
+      });
+
+      // トランスポートが閉じられたとき、transports から削除
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && transports[sid]) {
+          console.log(`Transport closed for session ID: ${sid}`);
+          delete transports[sid];
+        }
+      };
+
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    } else {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Bad Request: No valid session ID provided",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    // すでにセッション ID が存在する場合は、その transport を使用してリクエストを処理
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error("Error handling MCP request:", error);
@@ -48,8 +93,6 @@ app.post("/mcp", async (req, res) => {
       res.status(500).json({
         jsonrpc: "2.0",
         error: {
-          // JSON-RPC 2.0のエラーコードを指定
-          // http://www.jsonrpc.org/specification#error_object
           code: -32603,
           message: "Internal server error",
         },
@@ -75,42 +118,47 @@ app.get("/mcp", async (req, res) => {
   );
 });
 
-// DELETE リクエストはステートフルなサーバーの場合に実装する必要がある
+// DELETE リクエストを受け取った場合、セッションを閉じる
 app.delete("/mcp", async (req, res) => {
-  console.log("Received DELETE MCP request");
-  res.writeHead(405).end(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      error: {
-        code: -32000,
-        message: "Method not allowed.",
-      },
-      id: null,
-    })
-  );
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !transports[sessionId]) {
+    res
+      .status(400)
+      .send(
+        "Invalid or missing session ID. Please provide a valid session ID."
+      );
+    return;
+  }
+
+  console.log(`Closing session for ID: ${sessionId}`);
+
+  try {
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+  } catch (error) {
+    console.error("Error closing transport:", error);
+    if (!res.headersSent) {
+      res.status(500).send("Error closing transport");
+    }
+  }
 });
 
-const setupServer = async () => {
-  await mcpServer.connect(transport);
-};
-
-setupServer()
-  .then(() => {
-    app.listen(3000, () => {
-      console.log("Server is running on http://localhost:3000/mcp");
-    });
-  })
-  .catch((err) => {
-    console.error("Error setting up server:", err);
-    process.exit(1);
-  });
+app.listen(3000, () => {
+  console.log("Stateful server is running on http://localhost:3000/mcp");
+});
 
 // graceful shutdown
 process.on("SIGINT", async () => {
   console.log("Shutting down server...");
   try {
-    console.log(`Closing transport`);
-    await transport.close();
+    // すべてのトランスポートを閉じる
+    for (const sessionId in transports) {
+      const transport = transports[sessionId];
+      if (transport) {
+        await transport.close();
+        console.log(`Transport closed for session ID: ${sessionId}`);
+      }
+    }
   } catch (error) {
     console.error(`Error closing transport:`, error);
   }

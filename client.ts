@@ -8,13 +8,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { createInterface } from "readline/promises";
 
-// Streamable HTTP トランスポートを使用して MCP サーバーに接続
-const transport = new StreamableHTTPClientTransport(
-  new URL("http://localhost:3000/mcp"),
-  {
-    sessionId: undefined,
-  }
-);
+// セッション ID と transport を保持する変数
+let sessionId: string | undefined;
+let transport: StreamableHTTPClientTransport | undefined;
 
 const client = new Client({
   name: "example-client",
@@ -34,13 +30,25 @@ const readline = createInterface({
 async function main() {
   try {
     // サーバーに接続するリクエストを送信
+    transport = new StreamableHTTPClientTransport(
+      new URL("http://localhost:3000/mcp"),
+      {
+        sessionId,
+      }
+    );
+
+    // 初期化リクエストを送信
     await client.connect(transport);
+    // サーバーで生成されたセッション ID を取得
+    console.log("Session ID:", transport.sessionId);
+    sessionId = transport.sessionId;
 
     while (true) {
       console.log("avaible commands:");
       console.log("1. list-tools");
       console.log("2. call-tool");
       console.log("3. exit");
+      console.log("4. terminate-session");
       console.log("------------------------------");
 
       const answer = await readline.question("Enter your input: ");
@@ -51,6 +59,9 @@ async function main() {
           break;
         case "call-tool":
           await callTool();
+          break;
+        case "terminate-session":
+          await terminateSession();
           break;
         case "exit":
           await disconnect();
@@ -68,8 +79,27 @@ async function main() {
   }
 }
 
+// セッションを終了するメソッド
+async function terminateSession() {
+  if (!transport) {
+    console.log("No active transport to terminate.");
+    return;
+  }
+  await transport.terminateSession();
+  console.log("Session terminated.");
+
+  // sessionId が正しく消えているか確認
+  if (!transport.sessionId) {
+    console.log("Session ID:", transport.sessionId);
+    sessionId = undefined;
+  } else {
+    // server が DELETE リクエストをサポートしていない
+    console.log("Session ID not available. Unable to terminate session.");
+  }
+}
+
 async function disconnect() {
-  await transport.close();
+  await transport?.close();
   await client.close();
   readline.close();
   console.log("Disconnected from server.");
