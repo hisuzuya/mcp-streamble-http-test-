@@ -1,0 +1,21 @@
+{
+  "name": "mcp-streamble-http-test",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.1"
+  },
+  "scripts": {
+    "start": "bun run index.ts",
+    "inspect": "bunx @modelcontextprotocol/inspector"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/inspector": "^0.11.0",
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "express": "^5.1.0"
+  }
+}
