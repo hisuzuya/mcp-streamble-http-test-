@@ -1,13 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import express from "express";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { InMemoryEventStore } from "@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js";
 import { randomUUID } from "node:crypto";
+import { Hono } from "hono";
+import { toFetchResponse, toReqRes } from "fetch-to-node";
 
-const app = express();
-app.use(express.json());
+const app = new Hono();
 
 const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
@@ -37,8 +37,10 @@ mcpServer.tool(
 );
 
 // POST リクエストで受け付ける
-app.post("/mcp", async (req, res) => {
+app.post("/mcp", async (c) => {
+  const { req, res } = toReqRes(c.req.raw);
   try {
+    const body = await c.req.json();
     // セッション ID がヘッダーに存在するか確認
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     let transport: StreamableHTTPServerTransport;
@@ -48,7 +50,7 @@ app.post("/mcp", async (req, res) => {
       transport = transports[sessionId];
     } else if (
       // セッション ID が存在しないかつ、初期化リクエストの場合は新しい transport を作成
-      isInitializeRequest(req.body) &&
+      isInitializeRequest(body) &&
       !sessionId
     ) {
       const eventStore = new InMemoryEventStore();
@@ -71,63 +73,81 @@ app.post("/mcp", async (req, res) => {
       };
 
       await mcpServer.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-      return;
+      await transport.handleRequest(req, res, body);
+
+      // Node.jsのレスポンスをFetch APIのレスポンスに変換して返す
+      return toFetchResponse(res);
     } else {
-      res.status(400).json({
-        jsonrpc: "2.0",
-        error: {
-          code: -32000,
-          message: "Bad Request: No valid session ID provided",
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Bad Request: No valid session ID provided",
+          },
+          id: null,
         },
-        id: null,
-      });
-      return;
+        { status: 400 }
+      );
     }
 
     // すでにセッション ID が存在する場合は、その transport を使用してリクエストを処理
-    await transport.handleRequest(req, res, req.body);
+    await transport.handleRequest(req, res, body);
+
+    // Node.jsのレスポンスをFetch APIのレスポンスに変換して返す
+    return toFetchResponse(res);
   } catch (error) {
     console.error("Error handling MCP request:", error);
     if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: {
-          code: -32603,
-          message: "Internal server error",
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32603,
+            message: "Internal server error",
+          },
+          id: null,
         },
-        id: null,
-      });
+        { status: 500 }
+      );
     }
   }
 });
 
 // GET リクエストは SSE エンドポイントとの互換性のために実装する必要がある
 // SSE エンドポイントを実装しない場合は、405 Method Not Allowed を返す
-app.get("/mcp", async (req, res) => {
+app.get("/mcp", async (c) => {
   console.log("Received GET MCP request");
-  res.writeHead(405).end(
-    JSON.stringify({
+  return c.json(
+    {
       jsonrpc: "2.0",
       error: {
         code: -32000,
         message: "Method not allowed.",
       },
       id: null,
-    })
+    },
+    { status: 405 }
   );
 });
 
 // DELETE リクエストを受け取った場合、セッションを閉じる
-app.delete("/mcp", async (req, res) => {
+app.delete("/mcp", async (c) => {
+  const { req, res } = toReqRes(c.req.raw);
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports[sessionId]) {
-    res
-      .status(400)
-      .send(
-        "Invalid or missing session ID. Please provide a valid session ID."
-      );
-    return;
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message:
+            "Invalid or missing session ID. Please provide a valid session ID.",
+        },
+        id: null,
+      },
+      { status: 400 }
+    );
   }
 
   console.log(`Closing session for ID: ${sessionId}`);
@@ -135,19 +155,28 @@ app.delete("/mcp", async (req, res) => {
   try {
     const transport = transports[sessionId];
     await transport.handleRequest(req, res);
+
+    // Node.jsのレスポンスをFetch APIのレスポンスに変換して返す
+    return toFetchResponse(res);
   } catch (error) {
     console.error("Error closing transport:", error);
     if (!res.headersSent) {
-      res.status(500).send("Error closing transport");
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          error: {
+            code: -32603,
+            message: "Error closing transport",
+          },
+          id: null,
+        },
+        { status: 500 }
+      );
     }
   }
 });
 
-app.listen(3000, () => {
-  console.log("Stateful server is running on http://localhost:3000/mcp");
-});
-
-// graceful shutdown
+// シグナルを受け取ったらサーバーをシャットダウン
 process.on("SIGINT", async () => {
   console.log("Shutting down server...");
   try {
@@ -167,3 +196,10 @@ process.on("SIGINT", async () => {
   console.log("Server shutdown complete");
   process.exit(0);
 });
+
+console.log("Stateful server is running on http://localhost:3000/mcp");
+
+export default {
+  port: 3000,
+  fetch: app.fetch,
+};
